@@ -1,15 +1,27 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
-	"io/ioutil"
+	"log"
 	"math"
 	"math/rand"
 	"net/http"
+	"os"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/goburrow/modbus"
+	"github.com/plgd-dev/go-coap/v3/message/pool"
+	"github.com/plgd-dev/go-coap/v3/udp"
+)
+
+var (
+	enableMQTT   = flag.Bool("mqtt", false, "Enable MQTT service")
+	enableModbus = flag.Bool("modbus", false, "Enable Modbus service")
+	enableCoAP   = flag.Bool("coap", false, "Enable CoAP service")
 )
 
 // Config structure holds the configuration for the MQTT and web servers
@@ -22,6 +34,14 @@ type Config struct {
 		Address string `json:"address"`
 		Port    int    `json:"port"`
 	} `json:"web"`
+	CoAP struct {
+		Address string `json:"address"`
+		Port    int    `json:"port"`
+	} `json:"coap"`
+	ModBus struct {
+		Address string `json:"address"`
+		Port    int    `json:"port"`
+	} `json:"modbus"`
 }
 
 // OTData represents the structure of the data we send
@@ -40,18 +60,20 @@ type OTData struct {
 var config Config
 
 func main() {
+	flag.Parse()
+
 	// Load configuration from config.json
 	if err := loadConfig(); err != nil {
 		fmt.Println("Error loading config:", err)
 		return
 	}
 
-	// Handle the static HTML
+	// Convert flag status into a JSON object for the HTML page to read
+	// These values will pre-check the checkboxes in the HTML.
 	http.HandleFunc("/", serveHTML)
-	// Handle AJAX requests for data generation
 	http.HandleFunc("/generate", generateData)
 
-	// Start the web server with the loaded configuration
+	// Start the web server
 	webAddress := fmt.Sprintf("%s:%d", config.Web.Address, config.Web.Port)
 	fmt.Printf("Server started at http://%s\n", webAddress)
 	http.ListenAndServe(webAddress, nil)
@@ -59,7 +81,7 @@ func main() {
 
 // loadConfig reads the configuration from the config.json file
 func loadConfig() error {
-	data, err := ioutil.ReadFile("config.json")
+	data, err := os.ReadFile("config.json")
 	if err != nil {
 		return fmt.Errorf("could not read config file: %v", err)
 	}
@@ -74,65 +96,88 @@ func loadConfig() error {
 
 // serveHTML serves the static HTML file
 func serveHTML(w http.ResponseWriter, r *http.Request) {
-	html := `<!DOCTYPE html>
-	<html lang="en">
-	<head>
-		<meta charset="UTF-8">
-		<meta name="viewport" content="width=device-width, initial-scale=1.0">
-		<title>Service Selection</title>
-		<script>
-			let intervalId;
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Service Selection</title>
+    <script>
+        // Set the initial states based on command-line flags
+        const preselectedServices = {
+            mqtt: %t,
+            modbus: %t,
+            coap: %t
+        };
 
-			// Start sending data every second
-			function startSendingData() {
-				const selectedServices = [];
-				document.querySelectorAll('input[name="service"]:checked').forEach(checkbox => {
-					selectedServices.push(checkbox.value);
-				});
+        window.onload = function() {
+            const savedServices = JSON.parse(localStorage.getItem('selectedServices')) || [];
+            document.querySelectorAll('input[name="service"]').forEach(checkbox => {
+                if (savedServices.includes(checkbox.value) || preselectedServices[checkbox.value]) {
+                    checkbox.checked = true;
+                }
+            });
+            // Start sending data if any service is selected
+            if (document.querySelectorAll('input[name="service"]:checked').length > 0) {
+                startSendingData();
+            }
+        };
 
-				// Make sure there is at least one service selected
-				if (selectedServices.length > 0) {
-					intervalId = setInterval(() => {
-						fetch("/generate", {
-							method: "POST",
-							headers: {
-								"Content-Type": "application/json"
-							},
-							body: JSON.stringify({ services: selectedServices })
-						})
-						.then(response => response.text())
-						.then(data => {
-							document.getElementById("output").textContent = data;
-						});
-					}, 1000); // Send every 1000ms (1 second)
-				}
-			}
+        function startSendingData() {
+            const selectedServices = [];
+            document.querySelectorAll('input[name="service"]:checked').forEach(checkbox => {
+                selectedServices.push(checkbox.value);
+            });
 
-			// Stop sending data
-			function stopSendingData() {
-				clearInterval(intervalId);
-			}
+            if (selectedServices.length > 0) {
+                intervalId = setInterval(() => {
+                    fetch("/generate", {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json"
+                        },
+                        body: JSON.stringify({ services: selectedServices })
+                    })
+                    .then(response => response.text())
+                    .then(data => {
+                        document.getElementById("output").textContent = data;
+                    });
+                }, 1000);
+            }
+        }
 
-			// Monitor checkbox change
-			function onCheckboxChange() {
-				if (document.querySelector('input[name="service"]:checked')) {
-					startSendingData();
-				} else {
-					stopSendingData();
-				}
-			}
-		</script>
-	</head>
-	<body>
-		<h2>Select Services to Generate Fake Data</h2>
-		<form onsubmit="event.preventDefault();">
-			<ul>
-				<li><input type="checkbox" name="service" value="mqtt" onchange="onCheckboxChange()"> MQTT (Port 1883)</li>
-			</ul>
-		</form>
-		<pre id="output"></pre>
-	</body>
-	</html>`
+        function stopSendingData() {
+            clearInterval(intervalId);
+        }
+
+        function onCheckboxChange() {
+            const selectedServices = [];
+            document.querySelectorAll('input[name="service"]:checked').forEach(checkbox => {
+                selectedServices.push(checkbox.value);
+            });
+            localStorage.setItem('selectedServices', JSON.stringify(selectedServices));
+
+            if (selectedServices.length > 0) {
+                startSendingData();
+            } else {
+                stopSendingData();
+            }
+        }
+    </script>
+</head>
+<body>
+    <h2>Select Services to Generate Fake Data</h2>
+    <form onsubmit="event.preventDefault();">
+        <ul>
+            <li><input type="checkbox" name="service" value="mqtt" onchange="onCheckboxChange()"> MQTT</li>
+            <li><input type="checkbox" name="service" value="modbus" onchange="onCheckboxChange()"> Modbus</li>
+            <li><input type="checkbox" name="service" value="coap" onchange="onCheckboxChange()"> CoAP</li>
+        </ul>
+    </form>
+    <pre id="output"></pre>
+</body>
+</html>`, *enableMQTT, *enableModbus, *enableCoAP)
+
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(html))
 }
@@ -154,25 +199,23 @@ func generateData(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Simulate sending fake data over selected protocols
-	response := "Generated Fake Data:\n"
 	for _, service := range selected.Services {
-		var fakeData string
-
 		switch service {
 		case "mqtt":
-			fakeData = generateMQTTData()
+			generateMQTTData()
+		case "modbus":
+			generateModbusData()
+		case "coap":
+			generateCoAPData()
 		default:
-			fakeData = fmt.Sprintf("Unknown service: %s\n", service)
+			fmt.Sprintf("Unknown service: %s\n", service)
 		}
-
-		response += fakeData
 
 		// Simulate a delay for each service
 		time.Sleep(500 * time.Millisecond)
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte(response))
 }
 
 // generateMQTTData simulates the data generation and sending to an MQTT broker
@@ -207,7 +250,97 @@ func generateMQTTData() string {
 		time.Sleep(500 * time.Millisecond) // Simulate delay between messages
 	}
 
-	return fmt.Sprint("Sending OT MQTT data\n")
+	return "Sending OT MQTT data\n"
+}
+
+func generateModbusData() string {
+	handler := modbus.NewTCPClientHandler(fmt.Sprintf("%s:%d", config.ModBus.Address, config.ModBus.Port))
+	handler.Timeout = 1 * time.Second
+	handler.SlaveId = 1
+	handler.Logger = log.New(os.Stdout, "modbus: ", log.LstdFlags)
+
+	client := modbus.NewClient(handler)
+	err := handler.Connect()
+	if err != nil {
+		return fmt.Sprintf("Failed to connect to Modbus server on %s:%d: %v\n", config.ModBus.Address, config.ModBus.Port, err)
+	}
+	defer handler.Close()
+
+	// Simulate data generation and writing to Modbus registers
+	for i := 1; i <= rand.Intn(10)+1; i++ { // Randomize the number of devices (1-10)
+		deviceType := randomDeviceType()                  // Randomly choose a device type
+		deviceID := fmt.Sprintf("%s-%02d", deviceType, i) // Generate device IDs like "TempHumidity-01"
+
+		data := createOTData(deviceID, deviceType)
+
+		// Convert data to Modbus register values
+		registers := []uint16{
+			uint16(data.Timestamp.Unix() & 0xFFFF),
+			uint16((data.Timestamp.Unix() >> 16) & 0xFFFF),
+		}
+
+		if data.Temperature != nil {
+			registers = append(registers, uint16(*data.Temperature*100))
+		}
+		if data.Pressure != nil {
+			registers = append(registers, uint16(*data.Pressure*100))
+		}
+		if data.Humidity != nil {
+			registers = append(registers, uint16(*data.Humidity*100))
+		}
+		if data.Vibration != nil {
+			registers = append(registers, uint16(*data.Vibration*100))
+		}
+		if data.PowerConsumption != nil {
+			registers = append(registers, uint16(*data.PowerConsumption*100))
+		}
+		if data.FlowRate != nil {
+			registers = append(registers, uint16(*data.FlowRate*100))
+		}
+
+		// Write data to Modbus registers
+		// Convert []uint16 to []byte
+		registerBytes := make([]byte, len(registers)*2)
+		for i, reg := range registers {
+			registerBytes[i*2] = byte(reg >> 8)
+			registerBytes[i*2+1] = byte(reg & 0xFF)
+		}
+		_, err := client.WriteMultipleRegisters(0, uint16(len(registerBytes)/2), registerBytes)
+		if err != nil {
+			return fmt.Sprintf("Failed to write data to Modbus for device %s: %v\n", deviceID, err)
+		}
+
+		time.Sleep(500 * time.Millisecond) // Simulate delay between messages
+	}
+
+	return "Sending OT Modbus data\n"
+}
+
+// generateCoAPData simulates CoAP data generation (dummy)
+func generateCoAPData() {
+	coapAddress := fmt.Sprintf("%s:%d", config.CoAP.Address, config.CoAP.Port)
+	sync := make(chan bool)
+	co, err := udp.Dial(coapAddress)
+	if err != nil {
+		log.Fatalf("Error dialing: %v", err)
+	}
+	num := 0
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	obs, err := co.Observe(ctx, "/some/path", func(req *pool.Message) {
+		log.Printf("Got %+v\n", req)
+		num++
+		if num >= 10 {
+			sync <- true
+		}
+	})
+	if err != nil {
+		log.Fatalf("Unexpected error '%v'", err)
+	}
+	<-sync
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	obs.Cancel(ctx)
 }
 
 // randomDeviceType randomly selects a device type that sends different data

@@ -335,7 +335,7 @@ func generateCoAPData() {
 		}
 	})
 	if err != nil {
-		log.Fatalf("Unexpected error '%v'", err)
+		log.Printf("Unexpected error '%v'", err)
 	}
 	<-sync
 	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
